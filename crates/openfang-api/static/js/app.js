@@ -24,7 +24,39 @@ function escapeHtml(text) {
 function renderMarkdown(text) {
   if (!text) return '';
   if (typeof marked !== 'undefined') {
-    var html = marked.parse(text);
+    // Protect LaTeX blocks from marked.js mangling (underscores, backslashes, etc.)
+    var latexBlocks = [];
+    var protected_ = text;
+    // Protect display math $$...$$ first (greedy across lines)
+    protected_ = protected_.replace(/\$\$([\s\S]+?)\$\$/g, function(match) {
+      var idx = latexBlocks.length;
+      latexBlocks.push(match);
+      return '\x00LATEX' + idx + '\x00';
+    });
+    // Protect inline math $...$ (single line, not empty, not starting/ending with space)
+    protected_ = protected_.replace(/\$([^\s$](?:[^$]*[^\s$])?)\$/g, function(match) {
+      var idx = latexBlocks.length;
+      latexBlocks.push(match);
+      return '\x00LATEX' + idx + '\x00';
+    });
+    // Protect \[...\] display math
+    protected_ = protected_.replace(/\\\[([\s\S]+?)\\\]/g, function(match) {
+      var idx = latexBlocks.length;
+      latexBlocks.push(match);
+      return '\x00LATEX' + idx + '\x00';
+    });
+    // Protect \(...\) inline math
+    protected_ = protected_.replace(/\\\(([\s\S]+?)\\\)/g, function(match) {
+      var idx = latexBlocks.length;
+      latexBlocks.push(match);
+      return '\x00LATEX' + idx + '\x00';
+    });
+
+    var html = marked.parse(protected_);
+    // Restore LaTeX blocks
+    for (var i = 0; i < latexBlocks.length; i++) {
+      html = html.replace('\x00LATEX' + i + '\x00', latexBlocks[i]);
+    }
     // Add copy buttons to code blocks
     html = html.replace(/<pre><code/g, '<pre><button class="copy-btn" onclick="copyCode(this)">Copy</button><code');
     // Open external links in new tab
@@ -102,6 +134,8 @@ document.addEventListener('alpine:init', function() {
     lastError: '',
     version: '0.1.0',
     agentCount: 0,
+    pendingApprovalCount: 0,
+    lastPendingApprovalSignature: '',
     pendingAgent: null,
     focusMode: localStorage.getItem('openfang-focus') === 'true',
     showOnboarding: false,
@@ -119,6 +153,23 @@ document.addEventListener('alpine:init', function() {
         var agents = await OpenFangAPI.get('/api/agents');
         this.agents = Array.isArray(agents) ? agents : [];
         this.agentCount = this.agents.length;
+      } catch(e) { /* silent */ }
+    },
+
+    async refreshApprovals() {
+      try {
+        var data = await OpenFangAPI.get('/api/approvals');
+        var approvals = Array.isArray(data) ? data : (data.approvals || []);
+        var pending = approvals.filter(function(a) { return a.status === 'pending'; });
+        var signature = pending
+          .map(function(a) { return a.id; })
+          .sort()
+          .join(',');
+        if (pending.length > 0 && signature !== this.lastPendingApprovalSignature && typeof OpenFangToast !== 'undefined') {
+          OpenFangToast.warn('An agent is waiting for approval. Open Approvals to review.');
+        }
+        this.pendingApprovalCount = pending.length;
+        this.lastPendingApprovalSignature = signature;
       } catch(e) { /* silent */ }
     },
 
@@ -318,9 +369,13 @@ function app() {
 
       // Initial data load
       this.pollStatus();
+      Alpine.store('app').refreshApprovals();
       Alpine.store('app').checkOnboarding();
       Alpine.store('app').checkAuth();
-      setInterval(function() { self.pollStatus(); }, 5000);
+      setInterval(function() {
+        self.pollStatus();
+        Alpine.store('app').refreshApprovals();
+      }, 5000);
     },
 
     navigate(p) {

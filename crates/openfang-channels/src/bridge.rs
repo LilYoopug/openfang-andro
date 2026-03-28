@@ -11,14 +11,86 @@ use crate::types::{
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
-use openfang_types::message::ContentBlock;
 use futures::StreamExt;
 use openfang_types::agent::AgentId;
+use openfang_types::approval::ApprovalRequest;
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat};
+use openfang_types::message::ContentBlock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatCommandSpec {
+    pub name: &'static str,
+    pub desc: &'static str,
+    pub help: &'static str,
+    pub section: &'static str,
+}
+
+const CHANNEL_COMMAND_SPECS: &[ChatCommandSpec] = &[
+    ChatCommandSpec { name: "start", desc: "Show welcome message", help: "/start - show welcome message", section: "General" },
+    ChatCommandSpec { name: "help", desc: "Show available commands", help: "/help - show this help", section: "General" },
+    ChatCommandSpec { name: "agents", desc: "List running agents", help: "/agents - list running agents", section: "Session" },
+    ChatCommandSpec { name: "agent", desc: "Select agent (/agent <name>)", help: "/agent <name> - select which agent to talk to", section: "Session" },
+    ChatCommandSpec { name: "new", desc: "Reset session (clear history)", help: "/new - reset session (clear messages)", section: "Session" },
+    ChatCommandSpec { name: "compact", desc: "Trigger LLM session compaction", help: "/compact - trigger LLM session compaction", section: "Session" },
+    ChatCommandSpec { name: "model", desc: "Show or switch model", help: "/model [name] - show or switch agent model", section: "Session" },
+    ChatCommandSpec { name: "stop", desc: "Cancel current agent run", help: "/stop - cancel current agent run", section: "Session" },
+    ChatCommandSpec { name: "usage", desc: "Show session usage and cost", help: "/usage - show session token usage and cost", section: "Session" },
+    ChatCommandSpec { name: "think", desc: "Toggle extended thinking", help: "/think [on|off] - toggle extended thinking", section: "Session" },
+    ChatCommandSpec { name: "status", desc: "Show system status", help: "/status - show system status", section: "Info" },
+    ChatCommandSpec { name: "models", desc: "List available AI models", help: "/models - list available AI models", section: "Info" },
+    ChatCommandSpec { name: "providers", desc: "Show configured providers", help: "/providers - show configured providers", section: "Info" },
+    ChatCommandSpec { name: "skills", desc: "List installed skills", help: "/skills - list installed skills", section: "Info" },
+    ChatCommandSpec { name: "hands", desc: "List available and active hands", help: "/hands - list available and active hands", section: "Info" },
+    ChatCommandSpec { name: "workflows", desc: "List workflows", help: "/workflows - list workflows", section: "Automation" },
+    ChatCommandSpec { name: "workflow", desc: "Run workflow (/workflow run <name> [input])", help: "/workflow run <name> [input] - run a workflow", section: "Automation" },
+    ChatCommandSpec { name: "triggers", desc: "List event triggers", help: "/triggers - list event triggers", section: "Automation" },
+    ChatCommandSpec { name: "trigger", desc: "Manage triggers", help: "/trigger add <agent> <pattern> <prompt> | /trigger del <id>", section: "Automation" },
+    ChatCommandSpec { name: "schedules", desc: "List cron jobs", help: "/schedules - list cron jobs", section: "Automation" },
+    ChatCommandSpec { name: "schedule", desc: "Manage schedules", help: "/schedule add <agent> <cron-5-fields> <message> | /schedule del <id> | /schedule run <id>", section: "Automation" },
+    ChatCommandSpec { name: "approvals", desc: "List pending approvals", help: "/approvals - list pending approvals", section: "Automation" },
+    ChatCommandSpec { name: "approve", desc: "Approve request", help: "/approve <id> - approve a request", section: "Automation" },
+    ChatCommandSpec { name: "reject", desc: "Reject request", help: "/reject <id> - reject a request", section: "Automation" },
+    ChatCommandSpec { name: "budget", desc: "Show spending limits and costs", help: "/budget - show spending limits and current costs", section: "Monitoring" },
+    ChatCommandSpec { name: "peers", desc: "Show OFP peer network status", help: "/peers - show OFP peer network status", section: "Monitoring" },
+    ChatCommandSpec { name: "a2a", desc: "List discovered external A2A agents", help: "/a2a - list discovered external A2A agents", section: "Monitoring" },
+];
+
+pub fn channel_command_specs() -> &'static [ChatCommandSpec] {
+    CHANNEL_COMMAND_SPECS
+}
+
+fn is_channel_command(name: &str) -> bool {
+    channel_command_specs().iter().any(|spec| spec.name == name)
+}
+
+fn format_channel_help() -> String {
+    let sections = ["General", "Session", "Info", "Automation", "Monitoring"];
+    let mut msg = String::from("OpenFang Bot Commands:");
+
+    for section in sections {
+        let commands: Vec<&ChatCommandSpec> = channel_command_specs()
+            .iter()
+            .filter(|spec| spec.section == section)
+            .collect();
+        if commands.is_empty() {
+            continue;
+        }
+        msg.push_str("\n\n");
+        msg.push_str(section);
+        msg.push_str(":\n");
+        for spec in commands {
+            msg.push_str(spec.help);
+            msg.push('\n');
+        }
+        msg.pop();
+    }
+
+    msg
+}
 
 /// Kernel operations needed by channel adapters.
 ///
@@ -57,6 +129,20 @@ pub trait ChannelBridgeHandle: Send + Sync {
 
     /// Spawn an agent by manifest name, returning its ID.
     async fn spawn_agent_by_name(&self, manifest_name: &str) -> Result<AgentId, String>;
+
+    /// Transcribe raw audio bytes to text.
+    async fn transcribe_audio(
+        &self,
+        _audio_bytes: Vec<u8>,
+        _mime_type: &str,
+    ) -> Result<String, String> {
+        Err("Audio transcription not available.".to_string())
+    }
+
+    /// List pending approval requests for a specific agent.
+    async fn pending_approvals_for_agent(&self, _agent_id: AgentId) -> Vec<ApprovalRequest> {
+        Vec::new()
+    }
 
     /// Return uptime info string (e.g., "2h 15m, 5 agents").
     async fn uptime_info(&self) -> String {
@@ -396,6 +482,7 @@ fn channel_type_str(channel: &crate::types::ChannelType) -> &str {
         crate::types::ChannelType::WebChat => "webchat",
         crate::types::ChannelType::CLI => "cli",
         crate::types::ChannelType::Custom(s) => s.as_str(),
+        _ => "unknown",
     }
 }
 
@@ -407,7 +494,11 @@ async fn send_response(
     thread_id: Option<&str>,
     output_format: OutputFormat,
 ) {
-    let formatted = formatter::format_for_channel(&text, output_format);
+    let formatted = if adapter.name() == "wecom" {
+        formatter::format_for_wecom(&text, output_format)
+    } else {
+        formatter::format_for_channel(&text, output_format)
+    };
     let content = ChannelContent::Text(formatted);
 
     let result = if let Some(tid) = thread_id {
@@ -418,6 +509,15 @@ async fn send_response(
 
     if let Err(e) = result {
         error!("Failed to send response: {e}");
+    }
+}
+
+fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {
+    match channel_type {
+        "telegram" => OutputFormat::TelegramHtml,
+        "slack" => OutputFormat::SlackMrkdwn,
+        "wecom" => OutputFormat::PlainText,
+        _ => OutputFormat::Markdown,
     }
 }
 
@@ -471,6 +571,45 @@ fn sender_user_id(message: &ChannelMessage) -> &str {
         .unwrap_or(&message.sender.platform_id)
 }
 
+/// If an error contains "Agent not found", try to re-resolve the channel's default agent
+/// by name (the name stored at bridge startup). Returns `Some(new_id)` on success.
+async fn try_reresolution(
+    err: &str,
+    channel_key: &str,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    router: &Arc<AgentRouter>,
+) -> Option<AgentId> {
+    if !err.to_lowercase().contains("agent not found") {
+        return None;
+    }
+    let name = router.channel_default_name(channel_key)?;
+    info!(
+        channel = channel_key,
+        agent_name = %name,
+        "Agent not found — attempting re-resolution by name"
+    );
+    match handle.find_agent_by_name(&name).await {
+        Ok(Some(new_id)) => {
+            router.update_channel_default(channel_key, new_id);
+            info!(
+                channel = channel_key,
+                agent_name = %name,
+                new_id = %new_id,
+                "Re-resolved agent successfully"
+            );
+            Some(new_id)
+        }
+        _ => {
+            warn!(
+                channel = channel_key,
+                agent_name = %name,
+                "Re-resolution failed — agent not found by name"
+            );
+            None
+        }
+    }
+}
+
 /// Dispatch a single incoming message — handles bot commands or routes to an agent.
 ///
 /// Applies per-channel policies (DM/group filtering, rate limiting, formatting, threading).
@@ -486,17 +625,16 @@ async fn dispatch_message(
 
     // Fetch per-channel overrides (if configured)
     let overrides = handle.channel_overrides(ct_str).await;
-    let channel_default_format = match ct_str {
-        "telegram" => OutputFormat::TelegramHtml,
-        "slack" => OutputFormat::SlackMrkdwn,
-        _ => OutputFormat::Markdown,
-    };
+    let channel_default_format = default_output_format_for_channel(ct_str);
     let output_format = overrides
         .as_ref()
         .and_then(|o| o.output_format)
         .unwrap_or(channel_default_format);
     let threading_enabled = overrides.as_ref().map(|o| o.threading).unwrap_or(false);
-    let lifecycle_reactions = overrides.as_ref().map(|o| o.lifecycle_reactions).unwrap_or(true);
+    let lifecycle_reactions = overrides
+        .as_ref()
+        .map(|o| o.lifecycle_reactions)
+        .unwrap_or(true);
     let thread_id = if threading_enabled {
         message.thread_id.as_deref()
     } else {
@@ -522,7 +660,9 @@ async fn dispatch_message(
                 }
                 GroupPolicy::MentionOnly => {
                     // Only allow messages where the bot was @mentioned or commands.
-                    let was_mentioned = message.metadata.get("was_mentioned")
+                    let was_mentioned = message
+                        .metadata
+                        .get("was_mentioned")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     let is_command = matches!(&message.content, ChannelContent::Command { .. });
@@ -568,9 +708,16 @@ async fn dispatch_message(
     }
 
     // For images: download, base64 encode, and send as multimodal content blocks
-    if let ChannelContent::Image { ref url, ref caption } = message.content {
+    if let ChannelContent::Image {
+        ref url,
+        ref caption,
+    } = message.content
+    {
         let blocks = download_image_to_blocks(url, caption.as_deref()).await;
-        if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) {
+        if blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. }))
+        {
             // We have actual image data — send as structured blocks for vision
             dispatch_with_blocks(
                 blocks,
@@ -593,17 +740,26 @@ async fn dispatch_message(
     let text = match &message.content {
         ChannelContent::Text(t) => t.clone(),
         ChannelContent::Command { .. } => unreachable!(), // handled above
-        ChannelContent::Image { ref url, ref caption } => {
+        ChannelContent::Image {
+            ref url,
+            ref caption,
+        } => {
             // Fallback when image download failed
             match caption {
                 Some(c) => format!("[User sent a photo: {url}]\nCaption: {c}"),
                 None => format!("[User sent a photo: {url}]"),
             }
         }
-        ChannelContent::File { ref url, ref filename } => {
+        ChannelContent::File {
+            ref url,
+            ref filename,
+        } => {
             format!("[User sent a file ({filename}): {url}]")
         }
-        ChannelContent::Voice { ref url, duration_seconds } => {
+        ChannelContent::Voice {
+            ref url,
+            duration_seconds,
+        } => {
             format!("[User sent a voice message ({duration_seconds}s): {url}]")
         }
         ChannelContent::Location { lat, lon } => {
@@ -624,36 +780,7 @@ async fn dispatch_message(
             vec![]
         };
 
-        if matches!(
-            cmd,
-            "start"
-                | "help"
-                | "agents"
-                | "agent"
-                | "status"
-                | "models"
-                | "providers"
-                | "new"
-                | "compact"
-                | "model"
-                | "stop"
-                | "usage"
-                | "think"
-                | "skills"
-                | "hands"
-                | "workflows"
-                | "workflow"
-                | "triggers"
-                | "trigger"
-                | "schedules"
-                | "schedule"
-                | "approvals"
-                | "approve"
-                | "reject"
-                | "budget"
-                | "peers"
-                | "a2a"
-        ) {
+        if is_channel_command(cmd) {
             let result = handle_command(cmd, &args, handle, router, &message.sender).await;
             send_response(adapter, &message.sender, result, thread_id, output_format).await;
             return;
@@ -787,12 +914,22 @@ async fn dispatch_message(
         return;
     }
 
+    // Build channel key for re-resolution lookups
+    let channel_key = format!("{:?}", message.channel);
+
     // Auto-reply check — if enabled, the engine decides whether to process this message.
     // If auto-reply is enabled but suppressed for this message, skip agent call entirely.
     if let Some(reply) = handle.check_auto_reply(agent_id, &text).await {
         send_response(adapter, &message.sender, reply, thread_id, output_format).await;
         handle
-            .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None, thread_id)
+            .record_delivery(
+                agent_id,
+                ct_str,
+                &message.sender.platform_id,
+                true,
+                None,
+                thread_id,
+            )
             .await;
         return;
     }
@@ -811,8 +948,24 @@ async fn dispatch_message(
     // (which expire typing after ~5s) keep showing it during long LLM calls.
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
+    // Prepend sender context so the agent knows who is speaking.
+    // In group spaces this is essential for multi-user conversations.
+    let sender_name = &message.sender.display_name;
+    let sender_email = message
+        .metadata
+        .get("sender_email")
+        .and_then(|v| v.as_str());
+    let prefixed_text = if !sender_name.is_empty() {
+        match sender_email {
+            Some(email) => format!("[From: {sender_name} <{email}>] {text}"),
+            None => format!("[From: {sender_name}] {text}"),
+        }
+    } else {
+        text.clone()
+    };
+
     // Send to agent and relay response
-    let result = handle.send_message(agent_id, &text).await;
+    let result = handle.send_message(agent_id, &prefixed_text).await;
 
     // Stop the typing refresh now that we have a response
     typing_task.abort();
@@ -824,10 +977,83 @@ async fn dispatch_message(
             }
             send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle
-                .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None, thread_id)
+                .record_delivery(
+                    agent_id,
+                    ct_str,
+                    &message.sender.platform_id,
+                    true,
+                    None,
+                    thread_id,
+                )
                 .await;
         }
         Err(e) => {
+            // Try re-resolution before reporting error
+            if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
+                let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
+                let retry = handle.send_message(new_id, &text).await;
+                typing_task2.abort();
+                match retry {
+                    Ok(response) => {
+                        if lifecycle_reactions {
+                            send_lifecycle_reaction(
+                                adapter,
+                                &message.sender,
+                                msg_id,
+                                AgentPhase::Done,
+                            )
+                            .await;
+                        }
+                        send_response(adapter, &message.sender, response, thread_id, output_format)
+                            .await;
+                        handle
+                            .record_delivery(
+                                new_id,
+                                ct_str,
+                                &message.sender.platform_id,
+                                true,
+                                None,
+                                thread_id,
+                            )
+                            .await;
+                    }
+                    Err(e2) => {
+                        if lifecycle_reactions {
+                            send_lifecycle_reaction(
+                                adapter,
+                                &message.sender,
+                                msg_id,
+                                AgentPhase::Error,
+                            )
+                            .await;
+                        }
+                        warn!("Agent error after re-resolution for {new_id}: {e2}");
+                        let err_msg = sanitize_agent_error(&e2.to_string());
+                        if !adapter.suppress_error_responses() {
+                            send_response(
+                                adapter,
+                                &message.sender,
+                                err_msg.clone(),
+                                thread_id,
+                                output_format,
+                            )
+                            .await;
+                        }
+                        handle
+                            .record_delivery(
+                                new_id,
+                                ct_str,
+                                &message.sender.platform_id,
+                                false,
+                                Some(&err_msg),
+                                thread_id,
+                            )
+                            .await;
+                    }
+                }
+                return;
+            }
+
             if lifecycle_reactions {
                 send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
             }
@@ -940,7 +1166,9 @@ fn detect_image_magic(bytes: &[u8]) -> Option<String> {
     if bytes.len() >= 4 && bytes[..4] == [0x47, 0x49, 0x46, 0x38] {
         return Some("image/gif".to_string());
     }
-    if bytes.len() >= 12 && bytes[..4] == [0x52, 0x49, 0x46, 0x46] && bytes[8..12] == [0x57, 0x45, 0x42, 0x50]
+    if bytes.len() >= 12
+        && bytes[..4] == [0x52, 0x49, 0x46, 0x46]
+        && bytes[8..12] == [0x57, 0x45, 0x42, 0x50]
     {
         return Some("image/webp".to_string());
     }
@@ -1009,9 +1237,8 @@ async fn download_image_to_blocks(url: &str, caption: Option<&str>) -> Vec<Conte
     // 1. Trusted Content-Type header (only if image/*)
     // 2. Magic byte sniffing (most reliable for binary data)
     // 3. URL extension fallback
-    let media_type = header_type.unwrap_or_else(|| {
-        detect_image_magic(&bytes).unwrap_or_else(|| media_type_from_url(url))
-    });
+    let media_type = header_type
+        .unwrap_or_else(|| detect_image_magic(&bytes).unwrap_or_else(|| media_type_from_url(url)));
 
     if bytes.len() > MAX_IMAGE_BYTES {
         warn!(
@@ -1019,10 +1246,16 @@ async fn download_image_to_blocks(url: &str, caption: Option<&str>) -> Vec<Conte
             bytes.len()
         );
         let desc = match caption {
-            Some(c) => format!("[Image too large for vision ({} KB)]\nCaption: {c}", bytes.len() / 1024),
+            Some(c) => format!(
+                "[Image too large for vision ({} KB)]\nCaption: {c}",
+                bytes.len() / 1024
+            ),
             None => format!("[Image too large for vision ({} KB)]", bytes.len() / 1024),
         };
-        return vec![ContentBlock::Text { text: desc, provider_metadata: None }];
+        return vec![ContentBlock::Text {
+            text: desc,
+            provider_metadata: None,
+        }];
     }
 
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -1097,6 +1330,9 @@ async fn dispatch_with_blocks(
         }
     };
 
+    // Build channel key for re-resolution lookups
+    let channel_key = format!("{:?}", message.channel);
+
     // RBAC check
     if let Err(denied) = handle
         .authorize_channel_user(ct_str, sender_user_id(message), "chat")
@@ -1125,7 +1361,9 @@ async fn dispatch_with_blocks(
     // Continuous typing indicator (see spawn_typing_loop doc)
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
-    let result = handle.send_message_with_blocks(agent_id, blocks).await;
+    let result = handle
+        .send_message_with_blocks(agent_id, blocks.clone())
+        .await;
 
     typing_task.abort();
 
@@ -1136,10 +1374,83 @@ async fn dispatch_with_blocks(
             }
             send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle
-                .record_delivery(agent_id, ct_str, &message.sender.platform_id, true, None, thread_id)
+                .record_delivery(
+                    agent_id,
+                    ct_str,
+                    &message.sender.platform_id,
+                    true,
+                    None,
+                    thread_id,
+                )
                 .await;
         }
         Err(e) => {
+            // Try re-resolution before reporting error
+            if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
+                let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
+                let retry = handle.send_message_with_blocks(new_id, blocks).await;
+                typing_task2.abort();
+                match retry {
+                    Ok(response) => {
+                        if lifecycle_reactions {
+                            send_lifecycle_reaction(
+                                adapter,
+                                &message.sender,
+                                msg_id,
+                                AgentPhase::Done,
+                            )
+                            .await;
+                        }
+                        send_response(adapter, &message.sender, response, thread_id, output_format)
+                            .await;
+                        handle
+                            .record_delivery(
+                                new_id,
+                                ct_str,
+                                &message.sender.platform_id,
+                                true,
+                                None,
+                                thread_id,
+                            )
+                            .await;
+                    }
+                    Err(e2) => {
+                        if lifecycle_reactions {
+                            send_lifecycle_reaction(
+                                adapter,
+                                &message.sender,
+                                msg_id,
+                                AgentPhase::Error,
+                            )
+                            .await;
+                        }
+                        warn!("Agent error after re-resolution for {new_id}: {e2}");
+                        let err_msg = sanitize_agent_error(&e2.to_string());
+                        if !adapter.suppress_error_responses() {
+                            send_response(
+                                adapter,
+                                &message.sender,
+                                err_msg.clone(),
+                                thread_id,
+                                output_format,
+                            )
+                            .await;
+                        }
+                        handle
+                            .record_delivery(
+                                new_id,
+                                ct_str,
+                                &message.sender.platform_id,
+                                false,
+                                Some(&err_msg),
+                                thread_id,
+                            )
+                            .await;
+                    }
+                }
+                return;
+            }
+
             if lifecycle_reactions {
                 send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
             }
@@ -1192,47 +1503,7 @@ async fn handle_command(
             msg.push_str("\nCommands:\n/agents - list agents\n/agent <name> - select an agent\n/help - show this help");
             msg
         }
-        "help" => "OpenFang Bot Commands:\n\
-             \n\
-             Session:\n\
-             /agents - list running agents\n\
-             /agent <name> - select which agent to talk to\n\
-             /new - reset session (clear messages)\n\
-             /compact - trigger LLM session compaction\n\
-             /model [name] - show or switch agent model\n\
-             /stop - cancel current agent run\n\
-             /usage - show session token usage and cost\n\
-             /think [on|off] - toggle extended thinking\n\
-             \n\
-             Info:\n\
-             /models - list available AI models\n\
-             /providers - show configured providers\n\
-             /skills - list installed skills\n\
-             /hands - list available and active hands\n\
-             /status - show system status\n\
-             \n\
-             Automation:\n\
-             /workflows - list workflows\n\
-             /workflow run <name> [input] - run a workflow\n\
-             /triggers - list event triggers\n\
-             /trigger add <agent> <pattern> <prompt> - create trigger\n\
-             /trigger del <id> - remove trigger\n\
-             /schedules - list cron jobs\n\
-             /schedule add <agent> <cron-5-fields> <message> - create job\n\
-             /schedule del <id> - remove job\n\
-             /schedule run <id> - run job now\n\
-             /approvals - list pending approvals\n\
-             /approve <id> - approve a request\n\
-             /reject <id> - reject a request\n\
-             \n\
-             Monitoring:\n\
-             /budget - show spending limits and current costs\n\
-             /peers - show OFP peer network status\n\
-             /a2a - list discovered external A2A agents\n\
-             \n\
-             /start - show welcome message\n\
-             /help - show this help"
-            .to_string(),
+        "help" => format_channel_help(),
         "status" => handle.uptime_info().await,
         "agents" => {
             let agents = handle.list_agents().await.unwrap_or_default();
@@ -1248,7 +1519,15 @@ async fn handle_command(
         }
         "agent" => {
             if args.is_empty() {
-                return "Usage: /agent <name>".to_string();
+                let agents = handle.list_agents().await.unwrap_or_default();
+                if agents.is_empty() {
+                    return "No agents running. Usage: /agent <name>".to_string();
+                }
+                let mut msg = "Usage: /agent <name>\n\nAvailable agents:\n".to_string();
+                for (_, name) in &agents {
+                    msg.push_str(&format!("  - {name}\n"));
+                }
+                return msg.trim_end().to_string();
             }
             let agent_name = &args[0];
             match handle.find_agent_by_name(agent_name).await {
@@ -1551,6 +1830,32 @@ mod tests {
         assert_eq!(resolved, Some(agent_id));
     }
 
+    #[tokio::test]
+    async fn test_handle_command_agent_without_args_lists_agents() {
+        let agent_id = AgentId::new();
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
+            agents: Mutex::new(vec![(agent_id, "coder".to_string())]),
+        });
+        let router = Arc::new(AgentRouter::new());
+        let sender = ChannelUser {
+            platform_id: "user1".to_string(),
+            display_name: "Test".to_string(),
+            openfang_user: None,
+        };
+
+        let result = handle_command("agent", &[], &handle, &router, &sender).await;
+        assert!(result.contains("Usage: /agent <name>"));
+        assert!(result.contains("coder"));
+    }
+
+    #[test]
+    fn test_channel_command_specs_include_agent_and_help() {
+        let specs = channel_command_specs();
+        assert!(specs.iter().any(|spec| spec.name == "help"));
+        assert!(specs.iter().any(|spec| spec.name == "agent"));
+        assert!(specs.iter().any(|spec| spec.name == "agents"));
+    }
+
     #[test]
     fn test_rate_limiter_allows_within_limit() {
         let limiter = ChannelRateLimiter::default();
@@ -1606,6 +1911,26 @@ mod tests {
         assert_eq!(
             channel_type_str(&ChannelType::Custom("irc".to_string())),
             "irc"
+        );
+    }
+
+    #[test]
+    fn test_default_output_format_for_channel() {
+        assert_eq!(
+            default_output_format_for_channel("telegram"),
+            OutputFormat::TelegramHtml
+        );
+        assert_eq!(
+            default_output_format_for_channel("slack"),
+            OutputFormat::SlackMrkdwn
+        );
+        assert_eq!(
+            default_output_format_for_channel("wecom"),
+            OutputFormat::PlainText
+        );
+        assert_eq!(
+            default_output_format_for_channel("discord"),
+            OutputFormat::Markdown
         );
     }
 
@@ -1699,11 +2024,26 @@ mod tests {
 
     #[test]
     fn test_media_type_from_url() {
-        assert_eq!(media_type_from_url("https://example.com/photo.png"), "image/png");
-        assert_eq!(media_type_from_url("https://example.com/anim.gif"), "image/gif");
-        assert_eq!(media_type_from_url("https://example.com/img.webp"), "image/webp");
-        assert_eq!(media_type_from_url("https://example.com/photo.jpg"), "image/jpeg");
+        assert_eq!(
+            media_type_from_url("https://example.com/photo.png"),
+            "image/png"
+        );
+        assert_eq!(
+            media_type_from_url("https://example.com/anim.gif"),
+            "image/gif"
+        );
+        assert_eq!(
+            media_type_from_url("https://example.com/img.webp"),
+            "image/webp"
+        );
+        assert_eq!(
+            media_type_from_url("https://example.com/photo.jpg"),
+            "image/jpeg"
+        );
         // No extension — defaults to JPEG
-        assert_eq!(media_type_from_url("https://api.telegram.org/file/bot123/photos/file_42"), "image/jpeg");
+        assert_eq!(
+            media_type_from_url("https://api.telegram.org/file/bot123/photos/file_42"),
+            "image/jpeg"
+        );
     }
 }

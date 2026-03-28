@@ -189,6 +189,14 @@ const PROVIDERS: &[ProviderInfo] = &[
         hint: "",
     },
     ProviderInfo {
+        name: "nvidia",
+        display: "NVIDIA NIM",
+        env_var: "NVIDIA_API_KEY",
+        default_model: "nvidia/llama-3.1-nemotron-70b-instruct",
+        needs_key: true,
+        hint: "",
+    },
+    ProviderInfo {
         name: "claude-code",
         display: "Claude Code",
         env_var: "",
@@ -950,7 +958,9 @@ fn handle_migration_key(
                     let target_dir = if let Ok(h) = std::env::var("OPENFANG_HOME") {
                         PathBuf::from(h)
                     } else {
-                        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".openfang")
+                        dirs::home_dir()
+                            .unwrap_or_else(|| PathBuf::from("."))
+                            .join(".openfang")
                     };
                     let tx = migrate_tx.clone();
                     std::thread::spawn(move || {

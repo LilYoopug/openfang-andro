@@ -47,6 +47,9 @@ pub enum HandCategory {
     Development,
     Communication,
     Data,
+    Finance,
+    #[serde(other)]
+    Other,
 }
 
 impl std::fmt::Display for HandCategory {
@@ -58,6 +61,8 @@ impl std::fmt::Display for HandCategory {
             Self::Development => write!(f, "Development"),
             Self::Communication => write!(f, "Communication"),
             Self::Data => write!(f, "Data"),
+            Self::Finance => write!(f, "Finance"),
+            Self::Other => write!(f, "Other"),
         }
     }
 }
@@ -288,6 +293,11 @@ pub struct HandAgentConfig {
     pub system_prompt: String,
     #[serde(default)]
     pub max_iterations: Option<u32>,
+    /// Heartbeat interval in seconds for autonomous agents. Overrides the
+    /// AutonomousConfig default (30s), which is too aggressive for agents
+    /// making long LLM calls. Omit to use the kernel default.
+    #[serde(default)]
+    pub heartbeat_interval_secs: Option<u64>,
 }
 
 fn default_module() -> String {

@@ -153,6 +153,7 @@ impl StandaloneChat {
                 name,
                 result_preview,
                 is_error,
+                ..
             } => {
                 self.chat.tool_result(&name, &result_preview, is_error);
             }
@@ -394,10 +395,7 @@ impl StandaloneChat {
                                             .as_str()
                                             .unwrap_or("")
                                             .to_string(),
-                                        provider: m["provider"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string(),
+                                        provider: m["provider"].as_str().unwrap_or("").to_string(),
                                         tier: m["tier"].as_str().unwrap_or("Balanced").to_string(),
                                     })
                                     .collect()
@@ -459,16 +457,13 @@ impl StandaloneChat {
                                 .send()
                             {
                                 if let Ok(body) = resp.json::<serde_json::Value>() {
-                                    let provider =
-                                        body["model_provider"].as_str().unwrap_or("?");
+                                    let provider = body["model_provider"].as_str().unwrap_or("?");
                                     let model = body["model_name"].as_str().unwrap_or("?");
                                     self.chat.model_label = format!("{provider}/{model}");
                                 }
                             }
-                            self.chat.push_message(
-                                Role::System,
-                                format!("Switched to {model_id}"),
-                            );
+                            self.chat
+                                .push_message(Role::System, format!("Switched to {model_id}"));
                         }
                         _ => {
                             self.chat.push_message(
@@ -506,16 +501,12 @@ impl StandaloneChat {
                                     .unwrap_or_else(|| "?".to_string())
                             });
                             self.chat.model_label = format!("{prov_label}/{model_id}");
-                            self.chat.push_message(
-                                Role::System,
-                                format!("Switched to {model_id}"),
-                            );
+                            self.chat
+                                .push_message(Role::System, format!("Switched to {model_id}"));
                         }
                         Err(e) => {
-                            self.chat.push_message(
-                                Role::System,
-                                format!("Switch failed: {e}"),
-                            );
+                            self.chat
+                                .push_message(Role::System, format!("Switch failed: {e}"));
                         }
                     }
                 }

@@ -8,7 +8,7 @@ use crate::context_budget::{apply_context_guard, truncate_tool_result_dynamic, C
 use crate::context_overflow::{recover_from_overflow, RecoveryStage};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
-use crate::llm_driver::{CompletionRequest, LlmDriver, LlmError, StreamEvent};
+use crate::llm_driver::{CompletionRequest, DriverConfig, LlmDriver, LlmError, StreamEvent};
 use crate::llm_errors;
 use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
@@ -17,7 +17,7 @@ use crate::web_search::WebToolsContext;
 use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
-use openfang_types::agent::AgentManifest;
+use openfang_types::agent::{AgentManifest, FallbackModel};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
 use openfang_types::message::{
@@ -44,12 +44,63 @@ const BASE_RETRY_DELAY_MS: u64 = 1000;
 /// Raised from 60s to 120s for browser automation and long-running builds.
 const TOOL_TIMEOUT_SECS: u64 = 120;
 
+/// Timeout for inter-agent tool calls (seconds).
+/// Agent delegation (agent_send, agent_spawn) can involve a full agent loop on the
+/// target, so these need a significantly longer timeout than regular tools.
+const AGENT_TOOL_TIMEOUT_SECS: u64 = 600;
+
+/// Returns the appropriate timeout duration for a given tool name.
+/// Inter-agent calls get a longer timeout since they may trigger full agent loops.
+fn tool_timeout_for(tool_name: &str) -> Duration {
+    match tool_name {
+        "agent_send" | "agent_spawn" => Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS),
+        _ => Duration::from_secs(TOOL_TIMEOUT_SECS),
+    }
+}
+
 /// Maximum consecutive MaxTokens continuations before returning partial response.
 /// Raised from 3 to 5 to allow longer-form generation.
 const MAX_CONTINUATIONS: u32 = 5;
 
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
+
+/// Detect when the LLM claims to have performed an action (sent, posted, emailed)
+/// without actually calling any tools. Prevents hallucinated completions.
+fn phantom_action_detected(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let action_verbs = ["sent ", "posted ", "emailed ", "delivered ", "forwarded "];
+    let channel_refs = [
+        "telegram",
+        "whatsapp",
+        "slack",
+        "discord",
+        "email",
+        "channel",
+        "message sent",
+        "successfully sent",
+        "has been sent",
+    ];
+    let has_action = action_verbs.iter().any(|v| lower.contains(v));
+    let has_channel = channel_refs.iter().any(|c| lower.contains(c));
+    has_action && has_channel
+}
+
+/// Extra guidance injected after failed tool calls to prevent fabricated follow-up actions.
+const TOOL_ERROR_GUIDANCE: &str =
+    "[System: One or more tool calls failed. Failed tools did not produce usable data. Do NOT invent missing results, cite nonexistent search results, or pretend failed tools succeeded. If your next steps depend on a failed tool, either retry with a materially different approach or explain the failure to the user and stop. Do not write files, store memory, or take downstream actions based on failed tool outputs.]";
+
+fn append_tool_error_guidance(tool_result_blocks: &mut Vec<ContentBlock>) {
+    let has_tool_error = tool_result_blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }));
+    if has_tool_error {
+        tool_result_blocks.push(ContentBlock::Text {
+            text: TOOL_ERROR_GUIDANCE.to_string(),
+            provider_metadata: None,
+        });
+    }
+}
 
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
@@ -228,13 +279,34 @@ pub async fn run_agent_loop(
     }
 
     // Build the messages for the LLM, filtering system messages
-    // System prompt goes into the separate `system` field
+    // System prompt goes into the separate `system` field.
+    // NOTE: We build llm_messages BEFORE stripping images so the LLM
+    // sees the full image data for the current turn.
     let llm_messages: Vec<Message> = session
         .messages
         .iter()
         .filter(|m| m.role != Role::System)
         .cloned()
         .collect();
+
+    // Strip Image blocks from session to prevent base64 bloat.
+    // The LLM already received them via llm_messages above.
+    for msg in session.messages.iter_mut() {
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            let had_images = blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. }));
+            if had_images {
+                blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
+                if blocks.is_empty() {
+                    blocks.push(ContentBlock::Text {
+                        text: "[Image processed]".to_string(),
+                        provider_metadata: None,
+                    });
+                }
+            }
+        }
+    }
 
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
@@ -332,9 +404,22 @@ pub async fn run_agent_loop(
             cb(LoopPhase::Thinking);
         }
 
+        // Stamp last_active before the (potentially long) LLM call so the
+        // heartbeat monitor doesn't flag us as unresponsive mid-iteration.
+        if let Some(k) = &kernel {
+            k.touch_agent(&agent_id_str);
+        }
+
         // Call LLM with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
-        let mut response = call_with_retry(&*driver, request, Some(provider_name), None).await?;
+        let mut response = call_with_retry(
+            &*driver,
+            request,
+            Some(provider_name),
+            None,
+            &manifest.fallback_models,
+        )
+        .await?;
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -405,9 +490,12 @@ pub async fn run_agent_loop(
                 // One-shot retry: if the LLM returns empty text with no tool use,
                 // try once more before accepting the empty result.
                 // Triggers on first call OR when input_tokens=0 (silently failed request).
-                if text.trim().is_empty() && response.tool_calls.is_empty() {
-                    let is_silent_failure = response.usage.input_tokens == 0
-                        && response.usage.output_tokens == 0;
+                if text.trim().is_empty()
+                    && response.tool_calls.is_empty()
+                    && !response.has_any_content()
+                {
+                    let is_silent_failure =
+                        response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
                     if iteration == 0 || is_silent_failure {
                         warn!(
                             agent = %manifest.name,
@@ -446,6 +534,26 @@ pub async fn run_agent_loop(
                 } else {
                     text
                 };
+                // Phantom action detection: if the LLM claims it performed a
+                // channel action (send, post, email, etc.) but never actually
+                // called the corresponding tool, re-prompt once to force real
+                // tool usage instead of hallucinated completion.
+                let text = if !any_tools_executed
+                    && iteration == 0
+                    && phantom_action_detected(&text)
+                {
+                    warn!(agent = %manifest.name, "Phantom action detected — re-prompting for real tool use");
+                    messages.push(Message::assistant(text));
+                    messages.push(Message::user(
+                        "[System: You claimed to perform an action but did not call any tools. \
+                         You must use the appropriate tool (e.g., channel_send, web_fetch, file_write) \
+                         to actually perform the action. Do not claim completion without executing tools.]"
+                    ));
+                    continue;
+                } else {
+                    text
+                };
+
                 final_response = text.clone();
                 session.messages.push(Message::assistant(text));
 
@@ -562,7 +670,7 @@ pub async fn run_agent_loop(
 
                 // Execute each tool call with loop guard, timeout, and truncation
                 let mut tool_result_blocks = Vec::new();
-                for tool_call in &response.tool_calls {
+                for tool_call in deduplicate_tool_calls(&response) {
                     // Loop guard check
                     let verdict = loop_guard.check(&tool_call.name, &tool_call.input);
                     match &verdict {
@@ -644,8 +752,10 @@ pub async fn run_agent_loop(
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
                     // Timeout-wrapped execution
+                    let timeout = tool_timeout_for(&tool_call.name);
+                    let timeout_secs = timeout.as_secs();
                     let result = match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
+                        timeout,
                         tool_runner::execute_tool(
                             &tool_call.id,
                             &tool_call.name,
@@ -674,12 +784,12 @@ pub async fn run_agent_loop(
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", TOOL_TIMEOUT_SECS);
+                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", timeout_secs);
                             openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
                                 content: format!(
                                     "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
+                                    tool_call.name, timeout_secs
                                 ),
                                 is_error: true,
                             }
@@ -719,11 +829,16 @@ pub async fn run_agent_loop(
                     });
                 }
 
+                append_tool_error_guidance(&mut tool_result_blocks);
+
                 // Detect approval denials and inject guidance to prevent infinite retry loops
-                let denial_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                let denial_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
                         if content.contains("requires human approval and was denied"))
-                }).count();
+                    })
+                    .count();
                 if denial_count > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
                         text: format!(
@@ -740,9 +855,10 @@ pub async fn run_agent_loop(
                 }
 
                 // Detect tool errors and inject guidance to prevent fabrication
-                let error_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { is_error: true, .. })
-                }).count();
+                let error_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. }))
+                    .count();
                 let non_denial_errors = error_count.saturating_sub(denial_count);
                 if non_denial_errors > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
@@ -848,11 +964,15 @@ pub async fn run_agent_loop(
 ///
 /// Uses the `llm_errors` classifier for smart error handling and the
 /// `ProviderCooldown` circuit breaker to prevent request storms.
+///
+/// When the primary model returns a `ModelNotFound` error and `fallback_models`
+/// is non-empty, each fallback is tried in order before propagating the error.
 async fn call_with_retry(
     driver: &dyn LlmDriver,
     request: CompletionRequest,
     provider: Option<&str>,
     cooldown: Option<&ProviderCooldown>,
+    fallback_models: &[FallbackModel],
 ) -> OpenFangResult<crate::llm_driver::CompletionResponse> {
     // Check circuit breaker before calling
     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
@@ -941,6 +1061,73 @@ async fn call_with_retry(
                     cooldown.record_failure(provider, classified.is_billing);
                 }
 
+                // --- ModelNotFound fallback chain (issue #845) ---
+                // If the primary model was not found and fallback models are
+                // configured, try each fallback before giving up.
+                if classified.category == llm_errors::LlmErrorCategory::ModelNotFound
+                    && !fallback_models.is_empty()
+                {
+                    warn!(
+                        "Primary model not found, trying {} fallback model(s)",
+                        fallback_models.len()
+                    );
+                    for (fb_idx, fb) in fallback_models.iter().enumerate() {
+                        let api_key = fb
+                            .api_key_env
+                            .as_deref()
+                            .and_then(|env_name| std::env::var(env_name).ok());
+                        let fb_config = DriverConfig {
+                            provider: fb.provider.clone(),
+                            api_key,
+                            base_url: fb.base_url.clone(),
+                            skip_permissions: true,
+                        };
+                        let fb_driver = match crate::drivers::create_driver(&fb_config) {
+                            Ok(d) => d,
+                            Err(driver_err) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    error = %driver_err,
+                                    "Failed to create fallback driver, skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        let mut fb_request = request.clone();
+                        fb_request.model = fb.model.clone();
+                        warn!(
+                            fallback_index = fb_idx,
+                            provider = %fb.provider,
+                            model = %fb.model,
+                            "Trying fallback model"
+                        );
+                        match fb_driver.complete(fb_request).await {
+                            Ok(response) => {
+                                info!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    "Fallback model succeeded"
+                                );
+                                return Ok(response);
+                            }
+                            Err(fb_err) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    error = %fb_err,
+                                    "Fallback model failed"
+                                );
+                            }
+                        }
+                    }
+                    // All fallbacks exhausted — fall through to return the
+                    // original ModelNotFound error below.
+                }
+
                 // Include raw error detail so dashboard users can debug
                 let user_msg = if classified.category == llm_errors::LlmErrorCategory::Format {
                     format!("{} — raw: {}", classified.sanitized_message, raw_error)
@@ -960,12 +1147,16 @@ async fn call_with_retry(
 /// Call an LLM driver in streaming mode with automatic retry on rate-limit and overload errors.
 ///
 /// Uses the `llm_errors` classifier and `ProviderCooldown` circuit breaker.
+///
+/// When the primary model returns a `ModelNotFound` error and `fallback_models`
+/// is non-empty, each fallback is tried in order before propagating the error.
 async fn stream_with_retry(
     driver: &dyn LlmDriver,
     request: CompletionRequest,
     tx: mpsc::Sender<StreamEvent>,
     provider: Option<&str>,
     cooldown: Option<&ProviderCooldown>,
+    fallback_models: &[FallbackModel],
 ) -> OpenFangResult<crate::llm_driver::CompletionResponse> {
     // Check circuit breaker before calling
     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
@@ -1053,6 +1244,69 @@ async fn stream_with_retry(
 
                 if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                     cooldown.record_failure(provider, classified.is_billing);
+                }
+
+                // --- ModelNotFound fallback chain (issue #845) ---
+                if classified.category == llm_errors::LlmErrorCategory::ModelNotFound
+                    && !fallback_models.is_empty()
+                {
+                    warn!(
+                        "Primary model not found (stream), trying {} fallback model(s)",
+                        fallback_models.len()
+                    );
+                    for (fb_idx, fb) in fallback_models.iter().enumerate() {
+                        let api_key = fb
+                            .api_key_env
+                            .as_deref()
+                            .and_then(|env_name| std::env::var(env_name).ok());
+                        let fb_config = DriverConfig {
+                            provider: fb.provider.clone(),
+                            api_key,
+                            base_url: fb.base_url.clone(),
+                            skip_permissions: true,
+                        };
+                        let fb_driver = match crate::drivers::create_driver(&fb_config) {
+                            Ok(d) => d,
+                            Err(driver_err) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    error = %driver_err,
+                                    "Failed to create fallback stream driver, skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        let mut fb_request = request.clone();
+                        fb_request.model = fb.model.clone();
+                        warn!(
+                            fallback_index = fb_idx,
+                            provider = %fb.provider,
+                            model = %fb.model,
+                            "Trying fallback model (stream)"
+                        );
+                        match fb_driver.stream(fb_request, tx.clone()).await {
+                            Ok(response) => {
+                                info!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    "Fallback model succeeded (stream)"
+                                );
+                                return Ok(response);
+                            }
+                            Err(fb_err) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    error = %fb_err,
+                                    "Fallback model failed (stream)"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let user_msg = if classified.category == llm_errors::LlmErrorCategory::Format {
@@ -1199,6 +1453,25 @@ pub async fn run_agent_loop_streaming(
         .cloned()
         .collect();
 
+    // Strip Image blocks from session to prevent base64 bloat.
+    // The LLM already received them via llm_messages above.
+    for msg in session.messages.iter_mut() {
+        if let MessageContent::Blocks(blocks) = &mut msg.content {
+            let had_images = blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. }));
+            if had_images {
+                blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
+                if blocks.is_empty() {
+                    blocks.push(ContentBlock::Text {
+                        text: "[Image processed]".to_string(),
+                        provider_metadata: None,
+                    });
+                }
+            }
+        }
+    }
+
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
 
@@ -1282,6 +1555,14 @@ pub async fn run_agent_loop_streaming(
             }
         }
 
+        // Re-validate tool_call/tool_result pairing after overflow drains
+        // which may have broken assistant→tool ordering invariants.
+        // (Matches the non-streaming loop; fixes Qwen3.5-plus "tool_calls must
+        // be followed by tool messages" errors after context overflow recovery.)
+        if recovery != RecoveryStage::None {
+            messages = crate::session_repair::validate_and_repair(&messages);
+        }
+
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
 
@@ -1317,6 +1598,7 @@ pub async fn run_agent_loop_streaming(
             stream_tx.clone(),
             Some(provider_name),
             None,
+            &manifest.fallback_models,
         )
         .await?;
 
@@ -1386,9 +1668,12 @@ pub async fn run_agent_loop_streaming(
                 // One-shot retry: if the LLM returns empty text with no tool use,
                 // try once more before accepting the empty result.
                 // Triggers on first call OR when input_tokens=0 (silently failed request).
-                if text.trim().is_empty() && response.tool_calls.is_empty() {
-                    let is_silent_failure = response.usage.input_tokens == 0
-                        && response.usage.output_tokens == 0;
+                if text.trim().is_empty()
+                    && response.tool_calls.is_empty()
+                    && !response.has_any_content()
+                {
+                    let is_silent_failure =
+                        response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
                     if iteration == 0 || is_silent_failure {
                         warn!(
                             agent = %manifest.name,
@@ -1539,7 +1824,7 @@ pub async fn run_agent_loop_streaming(
 
                 // Execute each tool call with loop guard, timeout, and truncation
                 let mut tool_result_blocks = Vec::new();
-                for tool_call in &response.tool_calls {
+                for tool_call in deduplicate_tool_calls(&response) {
                     // Loop guard check
                     let verdict = loop_guard.check(&tool_call.name, &tool_call.input);
                     match &verdict {
@@ -1620,8 +1905,10 @@ pub async fn run_agent_loop_streaming(
                     let effective_exec_policy = manifest.exec_policy.as_ref();
 
                     // Timeout-wrapped execution
+                    let timeout = tool_timeout_for(&tool_call.name);
+                    let timeout_secs = timeout.as_secs();
                     let result = match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
+                        timeout,
                         tool_runner::execute_tool(
                             &tool_call.id,
                             &tool_call.name,
@@ -1650,12 +1937,12 @@ pub async fn run_agent_loop_streaming(
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", TOOL_TIMEOUT_SECS);
+                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", timeout_secs);
                             openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
                                 content: format!(
                                     "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
+                                    tool_call.name, timeout_secs
                                 ),
                                 is_error: true,
                             }
@@ -1691,6 +1978,7 @@ pub async fn run_agent_loop_streaming(
                     let preview: String = final_content.chars().take(300).collect();
                     if stream_tx
                         .send(StreamEvent::ToolExecutionResult {
+                            id: tool_call.id.clone(),
                             name: tool_call.name.clone(),
                             result_preview: preview,
                             is_error: result.is_error,
@@ -1709,11 +1997,16 @@ pub async fn run_agent_loop_streaming(
                     });
                 }
 
+                append_tool_error_guidance(&mut tool_result_blocks);
+
                 // Detect approval denials and inject guidance to prevent infinite retry loops
-                let denial_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                let denial_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
                         if content.contains("requires human approval and was denied"))
-                }).count();
+                    })
+                    .count();
                 if denial_count > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
                         text: format!(
@@ -1730,9 +2023,10 @@ pub async fn run_agent_loop_streaming(
                 }
 
                 // Detect tool errors and inject guidance to prevent fabrication
-                let error_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { is_error: true, .. })
-                }).count();
+                let error_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. }))
+                    .count();
                 let non_denial_errors = error_count.saturating_sub(denial_count);
                 if non_denial_errors > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
@@ -2130,9 +2424,7 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
         }
 
         // Custom arrow syntax: {tool => "name", args => {--key "value"}}
-        if let Some((tool_name, input)) =
-            parse_arrow_syntax_tool_call(inner, &tool_names)
-        {
+        if let Some((tool_name, input)) = parse_arrow_syntax_tool_call(inner, &tool_names) {
             if !calls
                 .iter()
                 .any(|c| c.name == tool_name && c.input == input)
@@ -2187,15 +2479,17 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
     {
         use regex_lite::Regex;
         // Match both self-closing <function ... /> and <function ...></function>
-        let re = Regex::new(
-            r#"<function\s+name="([^"]+)"\s+parameters="([^"]*)"[^/]*/?>"#
-        ).unwrap();
+        let re =
+            Regex::new(r#"<function\s+name="([^"]+)"\s+parameters="([^"]*)"[^/]*/?>"#).unwrap();
         for caps in re.captures_iter(text) {
             let tool_name = caps.get(1).unwrap().as_str();
             let raw_params = caps.get(2).unwrap().as_str();
 
             if !tool_names.contains(&tool_name) {
-                warn!(tool = tool_name, "XML-attribute tool call for unknown tool — skipping");
+                warn!(
+                    tool = tool_name,
+                    "XML-attribute tool call for unknown tool — skipping"
+                );
                 continue;
             }
 
@@ -2215,11 +2509,17 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
                 }
             };
 
-            if calls.iter().any(|c| c.name == tool_name && c.input == input) {
+            if calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
                 continue;
             }
 
-            info!(tool = tool_name, "Recovered XML-attribute tool call → synthetic ToolUse");
+            info!(
+                tool = tool_name,
+                "Recovered XML-attribute tool call → synthetic ToolUse"
+            );
             calls.push(ToolCall {
                 id: format!("recovered_{}", uuid::Uuid::new_v4()),
                 name: tool_name.to_string(),
@@ -2243,8 +2543,14 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
         search_from = after_tag + close_offset + close_tag.len();
 
         if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
-            if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
-                info!(tool = tool_name.as_str(), "Recovered tool call from <|plugin|> block");
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from <|plugin|> block"
+                );
                 calls.push(ToolCall {
                     id: format!("recovered_{}", uuid::Uuid::new_v4()),
                     name: tool_name,
@@ -2260,17 +2566,30 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i].trim();
-            if let Some(tool_part) = line.strip_prefix("Action:").or_else(|| line.strip_prefix("action:")) {
+            if let Some(tool_part) = line
+                .strip_prefix("Action:")
+                .or_else(|| line.strip_prefix("action:"))
+            {
                 let tool_name = tool_part.trim();
                 if tool_names.contains(&tool_name) {
                     // Look for "Action Input:" on the next line(s)
                     if i + 1 < lines.len() {
                         let next = lines[i + 1].trim();
-                        if let Some(json_part) = next.strip_prefix("Action Input:").or_else(|| next.strip_prefix("action input:")).or_else(|| next.strip_prefix("action_input:")) {
+                        if let Some(json_part) = next
+                            .strip_prefix("Action Input:")
+                            .or_else(|| next.strip_prefix("action input:"))
+                            .or_else(|| next.strip_prefix("action_input:"))
+                        {
                             let json_str = json_part.trim();
                             if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
-                                    info!(tool = tool_name, "Recovered tool call from Action/Action Input pattern");
+                                if !calls
+                                    .iter()
+                                    .any(|c| c.name == tool_name && c.input == input)
+                                {
+                                    info!(
+                                        tool = tool_name,
+                                        "Recovered tool call from Action/Action Input pattern"
+                                    );
                                     calls.push(ToolCall {
                                         id: format!("recovered_{}", uuid::Uuid::new_v4()),
                                         name: tool_name.to_string(),
@@ -2306,8 +2625,14 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
                 continue;
             }
             if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_line) {
-                if !calls.iter().any(|c| c.name == name_line && c.input == input) {
-                    info!(tool = name_line, "Recovered tool call from name+JSON line pair");
+                if !calls
+                    .iter()
+                    .any(|c| c.name == name_line && c.input == input)
+                {
+                    info!(
+                        tool = name_line,
+                        "Recovered tool call from name+JSON line pair"
+                    );
                     calls.push(ToolCall {
                         id: format!("recovered_{}", uuid::Uuid::new_v4()),
                         name: name_line.to_string(),
@@ -2332,8 +2657,14 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
         search_from = after_tag + close_offset + "</tool_use>".len();
 
         if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
-            if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
-                info!(tool = tool_name.as_str(), "Recovered tool call from <tool_use> block");
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from <tool_use> block"
+                );
                 calls.push(ToolCall {
                     id: format!("recovered_{}", uuid::Uuid::new_v4()),
                     name: tool_name,
@@ -2600,6 +2931,20 @@ fn try_parse_bare_json_tool_call(
     parse_json_tool_call_object(&text[..end], tool_names)
 }
 
+/// Deduplicate tool calls from the response.
+/// Returns a reference to the deduplicated tool calls.
+pub fn deduplicate_tool_calls(response: &crate::llm_driver::CompletionResponse) -> Vec<&ToolCall> {
+    let mut hash_set = std::collections::HashSet::new();
+    let mut deduplicated = Vec::new();
+    for tool_call in &response.tool_calls {
+        let hash = LoopGuard::compute_hash(&tool_call.name, &tool_call.input);
+        if hash_set.insert(hash) {
+            deduplicated.push(tool_call);
+        }
+    }
+    deduplicated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2661,6 +3006,15 @@ mod tests {
     #[test]
     fn test_tool_timeout_constant() {
         assert_eq!(TOOL_TIMEOUT_SECS, 120);
+        assert_eq!(AGENT_TOOL_TIMEOUT_SECS, 600);
+    }
+
+    #[test]
+    fn test_tool_timeout_for_agent_tools() {
+        assert_eq!(tool_timeout_for("agent_send"), Duration::from_secs(600));
+        assert_eq!(tool_timeout_for("agent_spawn"), Duration::from_secs(600));
+        assert_eq!(tool_timeout_for("file_read"), Duration::from_secs(120));
+        assert_eq!(tool_timeout_for("shell_exec"), Duration::from_secs(120));
     }
 
     #[test]
@@ -2834,6 +3188,61 @@ mod tests {
             result.response.contains("Task completed"),
             "Expected fallback message, got: {:?}",
             result.response
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_error_injects_no_fabrication_guidance() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(EmptyAfterToolUseDriver::new());
+
+        run_agent_loop(
+            &manifest,
+            "Do something with tools",
+            &mut session,
+            &memory,
+            driver,
+            &[], // no tools registered — the tool call will fail, which is fine
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // on_phase
+            None, // media_engine
+            None, // tts_engine
+            None, // docker_config
+            None, // hooks
+            None, // context_window_tokens
+            None, // process_manager
+            None, // user_content_blocks
+        )
+        .await
+        .expect("Loop should complete without error");
+
+        let guidance_seen = session.messages.iter().any(|msg| {
+            match &msg.content {
+            MessageContent::Blocks(blocks) => blocks.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text, .. } if text == TOOL_ERROR_GUIDANCE)
+            }),
+            _ => false,
+        }
+        });
+
+        assert!(
+            guidance_seen,
+            "Expected tool error guidance in session messages after failed tool call"
         );
     }
 
@@ -3539,7 +3948,8 @@ mod tests {
             input_schema: serde_json::json!({}),
         }];
         // Same call in both function tag and tool tag — should only appear once
-        let text = r#"<function=exec>{"command":"ls"}</function> <tool>exec{"command":"ls"}</tool>"#;
+        let text =
+            r#"<function=exec>{"command":"ls"}</function> <tool>exec{"command":"ls"}</tool>"#;
         let calls = recover_text_tool_calls(text, &tools);
         assert_eq!(calls.len(), 1);
     }
@@ -3736,7 +4146,8 @@ mod tests {
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
         }];
-        let text = "I'll run that: {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}";
+        let text =
+            "I'll run that: {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}";
         let calls = recover_text_tool_calls(text, &tools);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell_exec");
@@ -3832,7 +4243,8 @@ mod tests {
             description: "Search".into(),
             input_schema: serde_json::json!({}),
         }];
-        let text = "<|plugin|>\n{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}\n<|endofblock|>";
+        let text =
+            "<|plugin|>\n{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}\n<|endofblock|>";
         let calls = recover_text_tool_calls(text, &tools);
         assert!(calls.is_empty());
     }
@@ -3902,7 +4314,8 @@ mod tests {
             description: "Search".into(),
             input_schema: serde_json::json!({}),
         }];
-        let text = "<tool_use>{\"name\": \"web_search\", \"arguments\": {\"query\": \"test\"}}</tool_use>";
+        let text =
+            "<tool_use>{\"name\": \"web_search\", \"arguments\": {\"query\": \"test\"}}</tool_use>";
         let calls = recover_text_tool_calls(text, &tools);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "web_search");
@@ -3970,10 +4383,8 @@ mod tests {
     #[test]
     fn test_parse_json_tool_call_object_unknown_tool() {
         let tool_names = vec!["shell_exec"];
-        let result = parse_json_tool_call_object(
-            "{\"name\": \"unknown\", \"arguments\": {}}",
-            &tool_names,
-        );
+        let result =
+            parse_json_tool_call_object("{\"name\": \"unknown\", \"arguments\": {}}", &tool_names);
         assert!(result.is_none());
     }
 

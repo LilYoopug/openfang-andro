@@ -46,6 +46,7 @@ impl MatrixAdapter {
         user_id: String,
         access_token: String,
         allowed_rooms: Vec<String>,
+        auto_accept_invites: bool,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
@@ -57,7 +58,7 @@ impl MatrixAdapter {
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
             since_token: Arc::new(RwLock::new(None)),
-            auto_accept_invites: true,
+            auto_accept_invites,
         }
     }
 
@@ -160,9 +161,7 @@ async fn get_room_member_count(
     access_token: &str,
     room_id: &str,
 ) -> Option<usize> {
-    let url = format!(
-        "{homeserver}/_matrix/client/v3/rooms/{room_id}/joined_members"
-    );
+    let url = format!("{homeserver}/_matrix/client/v3/rooms/{room_id}/joined_members");
     let resp = client
         .get(&url)
         .bearer_auth(access_token)
@@ -220,7 +219,11 @@ impl ChannelAdapter for MatrixAdapter {
         let (tx, rx) = mpsc::channel::<ChannelMessage>(256);
         let homeserver = self.homeserver_url.clone();
         let access_token = self.access_token.clone();
-        let user_id = self.user_id.clone();
+        // Use the validated user ID from /whoami instead of the config value.
+        // Matrix server delegation or casing differences can cause self.user_id
+        // to not match the sender field in timeline events, making the bot
+        // process its own replies in an infinite loop (see #757).
+        let user_id = validated_user;
         let allowed_rooms = self.allowed_rooms.clone();
         let client = self.client.clone();
         let since_token = Arc::clone(&self.since_token);
@@ -237,6 +240,11 @@ impl ChannelAdapter for MatrixAdapter {
 
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
+            // Track recently seen event IDs to prevent duplicate processing
+            // on sync token races or reconnects.
+            let mut seen_events: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            const MAX_SEEN: usize = 500;
 
             loop {
                 // Build /sync URL
@@ -296,10 +304,13 @@ impl ChannelAdapter for MatrixAdapter {
                             if !allowed_rooms.is_empty()
                                 && !allowed_rooms.iter().any(|r| r == room_id)
                             {
-                                debug!("Matrix: ignoring invite to {room_id} (not in allowed_rooms)");
+                                debug!(
+                                    "Matrix: ignoring invite to {room_id} (not in allowed_rooms)"
+                                );
                                 continue;
                             }
-                            accept_invite(&client, &homeserver, access_token.as_str(), room_id).await;
+                            accept_invite(&client, &homeserver, access_token.as_str(), room_id)
+                                .await;
                         }
                     }
                 }
@@ -324,6 +335,21 @@ impl ChannelAdapter for MatrixAdapter {
                                     continue; // Skip own messages
                                 }
 
+                                // Dedup: skip events we've already processed.
+                                let event_id_str =
+                                    event["event_id"].as_str().unwrap_or("").to_string();
+                                if !event_id_str.is_empty() {
+                                    if seen_events.contains(&event_id_str) {
+                                        debug!("Matrix: skipping duplicate event {event_id_str}");
+                                        continue;
+                                    }
+                                    seen_events.insert(event_id_str.clone());
+                                    // Prevent unbounded growth
+                                    if seen_events.len() > MAX_SEEN {
+                                        seen_events.clear();
+                                    }
+                                }
+
                                 let content = event["content"]["body"].as_str().unwrap_or("");
                                 if content.is_empty() {
                                     continue;
@@ -343,8 +369,6 @@ impl ChannelAdapter for MatrixAdapter {
                                 } else {
                                     ChannelContent::Text(content.to_string())
                                 };
-
-                                let event_id = event["event_id"].as_str().unwrap_or("").to_string();
 
                                 // FIX #2: Detect @mentions in message text.
                                 let mut metadata = HashMap::new();
@@ -372,15 +396,41 @@ impl ChannelAdapter for MatrixAdapter {
                                         "was_mentioned".to_string(),
                                         serde_json::json!(true),
                                     );
+                                    metadata.insert("is_dm".to_string(), serde_json::json!(true));
+                                }
+
+                                // FIX #2: Detect @mentions in message text.
+                                let mut metadata = HashMap::new();
+                                if content.contains(&user_id) {
                                     metadata.insert(
-                                        "is_dm".to_string(),
+                                        "was_mentioned".to_string(),
                                         serde_json::json!(true),
                                     );
                                 }
 
+                                // FIX #3: Determine if room is a DM (2 members) or group.
+                                let is_group = get_room_member_count(
+                                    &client,
+                                    &homeserver,
+                                    access_token.as_str(),
+                                    room_id,
+                                )
+                                .await
+                                .map(|count| count > 2)
+                                .unwrap_or(true);
+
+                                // For DMs, auto-set was_mentioned so dm_policy works.
+                                if !is_group {
+                                    metadata.insert(
+                                        "was_mentioned".to_string(),
+                                        serde_json::json!(true),
+                                    );
+                                    metadata.insert("is_dm".to_string(), serde_json::json!(true));
+                                }
+
                                 let channel_msg = ChannelMessage {
                                     channel: ChannelType::Matrix,
-                                    platform_message_id: event_id,
+                                    platform_message_id: event_id_str,
                                     sender: ChannelUser {
                                         platform_id: room_id.clone(),
                                         display_name: sender.to_string(),
@@ -463,6 +513,7 @@ mod tests {
             "@bot:matrix.org".to_string(),
             "access_token".to_string(),
             vec![],
+            false,
         );
         assert_eq!(adapter.name(), "matrix");
     }
@@ -474,6 +525,7 @@ mod tests {
             "@bot:matrix.org".to_string(),
             "token".to_string(),
             vec!["!room1:matrix.org".to_string()],
+            false,
         );
         assert!(adapter.is_allowed_room("!room1:matrix.org"));
         assert!(!adapter.is_allowed_room("!room2:matrix.org"));
@@ -483,6 +535,7 @@ mod tests {
             "@bot:matrix.org".to_string(),
             "token".to_string(),
             vec![],
+            false,
         );
         assert!(open.is_allowed_room("!any:matrix.org"));
     }

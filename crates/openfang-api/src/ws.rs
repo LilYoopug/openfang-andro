@@ -439,6 +439,7 @@ async fn handle_text_message(
 
             // Resolve file attachments into image content blocks
             let mut has_images = false;
+            let mut ws_content_blocks: Option<Vec<openfang_types::message::ContentBlock>> = None;
             if let Some(attachments) = parsed["attachments"].as_array() {
                 let refs: Vec<crate::types::AttachmentRef> = attachments
                     .iter()
@@ -448,11 +449,7 @@ async fn handle_text_message(
                     let image_blocks = crate::routes::resolve_attachments(&refs);
                     if !image_blocks.is_empty() {
                         has_images = true;
-                        crate::routes::inject_attachments_into_session(
-                            &state.kernel,
-                            agent_id,
-                            image_blocks,
-                        );
+                        ws_content_blocks = Some(image_blocks);
                     }
                 }
             }
@@ -502,10 +499,14 @@ async fn handle_text_message(
             // Send message to agent with streaming
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
-            match state
-                .kernel
-                .send_message_streaming(agent_id, &content, Some(kernel_handle), None, None)
-            {
+            match state.kernel.send_message_streaming(
+                agent_id,
+                &content,
+                Some(kernel_handle),
+                None,
+                None,
+                ws_content_blocks,
+            ) {
                 Ok((mut rx, handle)) => {
                     // Forward stream events to WebSocket with debouncing.
                     //
@@ -712,7 +713,8 @@ async fn handle_text_message(
                             };
 
                             // Estimate context pressure
-                            let ctx_pct = (usage.input_tokens as f64 / 200_000.0 * 100.0).min(100.0);
+                            let ctx_pct =
+                                (usage.input_tokens as f64 / 200_000.0 * 100.0).min(100.0);
                             let pressure = if ctx_pct > 85.0 {
                                 "critical"
                             } else if ctx_pct > 70.0 {
@@ -996,11 +998,14 @@ async fn handle_command(
 fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_json::Value> {
     match event {
         StreamEvent::TextDelta { .. } => None, // Handled by debounce buffer
-        StreamEvent::ToolUseStart { name, .. } => Some(serde_json::json!({
+        StreamEvent::ToolUseStart { id, name, .. } => Some(serde_json::json!({
             "type": "tool_start",
+            "id": id,
             "tool": name,
         })),
-        StreamEvent::ToolUseEnd { name, input, .. } if name == "canvas_present" => {
+        StreamEvent::ToolUseEnd {
+            id, name, input, ..
+        } if name == "canvas_present" => {
             let html = input.get("html").and_then(|v| v.as_str()).unwrap_or("");
             let title = input
                 .get("title")
@@ -1008,12 +1013,15 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                 .unwrap_or("Canvas");
             Some(serde_json::json!({
                 "type": "canvas",
+                "id": id,
                 "canvas_id": uuid::Uuid::new_v4().to_string(),
                 "html": html,
                 "title": title,
             }))
         }
-        StreamEvent::ToolUseEnd { name, input, .. } => match verbose {
+        StreamEvent::ToolUseEnd {
+            id, name, input, ..
+        } => match verbose {
             VerboseLevel::Off => None,
             VerboseLevel::On => {
                 let input_preview: String = serde_json::to_string(input)
@@ -1023,6 +1031,7 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                     .collect();
                 Some(serde_json::json!({
                     "type": "tool_end",
+                    "id": id,
                     "tool": name,
                     "input": input_preview,
                 }))
@@ -1035,18 +1044,21 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                     .collect();
                 Some(serde_json::json!({
                     "type": "tool_end",
+                    "id": id,
                     "tool": name,
                     "input": input_preview,
                 }))
             }
         },
         StreamEvent::ToolExecutionResult {
+            id,
             name,
             result_preview,
             is_error,
         } => match verbose {
             VerboseLevel::Off => Some(serde_json::json!({
                 "type": "tool_result",
+                "id": id,
                 "tool": name,
                 "is_error": is_error,
             })),
@@ -1054,6 +1066,7 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                 let truncated: String = result_preview.chars().take(200).collect();
                 Some(serde_json::json!({
                     "type": "tool_result",
+                    "id": id,
                     "tool": name,
                     "result": truncated,
                     "is_error": is_error,
@@ -1061,6 +1074,7 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             }
             VerboseLevel::Full => Some(serde_json::json!({
                 "type": "tool_result",
+                "id": id,
                 "tool": name,
                 "result": result_preview,
                 "is_error": is_error,
@@ -1183,7 +1197,10 @@ fn classify_streaming_error(err: &openfang_kernel::error::KernelError) -> String
             if inner.contains("localhost:11434") || inner.contains("ollama") {
                 "Model not found on Ollama. Run `ollama pull <model>` first. Use /model to see options.".to_string()
             } else {
-                format!("{}. Use /model to see options.", classified.sanitized_message)
+                format!(
+                    "{}. Use /model to see options.",
+                    classified.sanitized_message
+                )
             }
         }
         llm_errors::LlmErrorCategory::Format => {

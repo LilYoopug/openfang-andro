@@ -216,7 +216,9 @@ pub trait KernelHandle: Send + Sync {
         filename: Option<&str>,
         thread_id: Option<&str>,
     ) -> Result<String, String> {
-        let _ = (channel, recipient, media_type, media_url, caption, filename, thread_id);
+        let _ = (
+            channel, recipient, media_type, media_url, caption, filename, thread_id,
+        );
         Err("Channel media send not available".to_string())
     }
 
@@ -234,6 +236,12 @@ pub trait KernelHandle: Send + Sync {
     ) -> Result<String, String> {
         let _ = (channel, recipient, data, filename, mime_type, thread_id);
         Err("Channel file data send not available".to_string())
+    }
+
+    /// Refresh an agent's last_active timestamp without changing any other state.
+    /// Called by the agent loop before long LLM calls to prevent heartbeat false-positives.
+    fn touch_agent(&self, agent_id: &str) {
+        let _ = agent_id;
     }
 
     /// Spawn an agent with capability inheritance enforcement.

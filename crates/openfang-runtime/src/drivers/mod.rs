@@ -11,14 +11,15 @@ pub mod fallback;
 pub mod gemini;
 pub mod openai;
 pub mod qwen_code;
+pub mod vertex;
 
 use crate::llm_driver::{DriverConfig, LlmDriver, LlmError};
 use openfang_types::model_catalog::{
-    AI21_BASE_URL, ANTHROPIC_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL,
-    DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL,
-    KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL, MINIMAX_BASE_URL,
-    MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
-    OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
+    AI21_BASE_URL, ANTHROPIC_BASE_URL, AZURE_OPENAI_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL,
+    COHERE_BASE_URL, DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL,
+    HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
+    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
+    OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
     REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
     VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
     ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
@@ -221,6 +222,17 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "NVIDIA_API_KEY",
             key_required: true,
         }),
+        "azure" | "azure-openai" => Some(ProviderDefaults {
+            base_url: AZURE_OPENAI_BASE_URL,
+            api_key_env: "AZURE_OPENAI_API_KEY",
+            key_required: true,
+        }),
+        "vertex-ai" | "vertex" | "google-vertex" => Some(ProviderDefaults {
+            // Vertex AI uses OAuth, not API keys - base_url is per-project
+            base_url: "https://us-central1-aiplatform.googleapis.com",
+            api_key_env: "GOOGLE_APPLICATION_CREDENTIALS",
+            key_required: false, // Uses OAuth service account, not API key
+        }),
         _ => None,
     }
 }
@@ -295,9 +307,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             .or_else(crate::model_catalog::read_codex_credential)
             .ok_or_else(|| {
-                LlmError::MissingApiKey(
-                    "Set OPENAI_API_KEY or install Codex CLI".to_string(),
-                )
+                LlmError::MissingApiKey("Set OPENAI_API_KEY or install Codex CLI".to_string())
             })?;
         let base_url = config
             .base_url
@@ -345,6 +355,59 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             github_token,
             base_url,
         )));
+    }
+
+    // Azure OpenAI — deployment-based URL with `api-key` header
+    if provider == "azure" || provider == "azure-openai" {
+        let api_key = config
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("AZURE_OPENAI_API_KEY").ok())
+            .ok_or_else(|| {
+                LlmError::MissingApiKey(
+                    "Set AZURE_OPENAI_API_KEY environment variable for Azure OpenAI".to_string(),
+                )
+            })?;
+        let base_url = config.base_url.clone().ok_or_else(|| LlmError::Api {
+            status: 0,
+            message: "Azure OpenAI requires base_url — set it to \
+                      https://{resource}.openai.azure.com/openai/deployments"
+                .to_string(),
+        })?;
+        return Ok(Arc::new(openai::OpenAIDriver::new_azure(api_key, base_url)));
+    }
+
+    // Vertex AI — uses Google Cloud OAuth with service account credentials.
+    // Requires GOOGLE_APPLICATION_CREDENTIALS env var pointing to service account JSON,
+    // and the service account must be activated via gcloud CLI.
+    if provider == "vertex-ai" || provider == "vertex" || provider == "google-vertex" {
+        // Get project_id from environment or service account JSON
+        let project_id = std::env::var("GOOGLE_CLOUD_PROJECT")
+            .or_else(|_| std::env::var("GCLOUD_PROJECT"))
+            .or_else(|_| std::env::var("GCP_PROJECT"))
+            .or_else(|_| {
+                // Try to read from service account JSON
+                if let Ok(creds_path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+                    if let Ok(contents) = std::fs::read_to_string(&creds_path) {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                            if let Some(proj) = json.get("project_id").and_then(|v| v.as_str()) {
+                                return Ok(proj.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(std::env::VarError::NotPresent)
+            })
+            .map_err(|_| {
+                LlmError::MissingApiKey(
+                    "Set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_CLOUD_PROJECT for Vertex AI"
+                        .to_string(),
+                )
+            })?;
+        let region = std::env::var("GOOGLE_CLOUD_REGION")
+            .or_else(|_| std::env::var("VERTEX_AI_REGION"))
+            .unwrap_or_else(|_| "us-central1".to_string());
+        return Ok(Arc::new(vertex::VertexAIDriver::new(project_id, region)));
     }
 
     // Kimi for Code — Anthropic-compatible endpoint
@@ -423,7 +486,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     Err(LlmError::Api {
         status: 0,
         message: format!(
-            "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
+            "Unknown provider '{}'. Supported: anthropic, gemini, openai, azure, groq, openrouter, \
              deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
              cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
              chutes, venice, nvidia, codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
@@ -444,21 +507,45 @@ pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'stat
         ("gemini", "gemini-2.5-flash", "GEMINI_API_KEY"),
         ("groq", "llama-3.3-70b-versatile", "GROQ_API_KEY"),
         ("deepseek", "deepseek-chat", "DEEPSEEK_API_KEY"),
-        ("openrouter", "openrouter/google/gemini-2.5-flash", "OPENROUTER_API_KEY"),
+        (
+            "openrouter",
+            "openrouter/google/gemini-2.5-flash",
+            "OPENROUTER_API_KEY",
+        ),
         ("mistral", "mistral-large-latest", "MISTRAL_API_KEY"),
-        ("together", "meta-llama/Llama-3-70b-chat-hf", "TOGETHER_API_KEY"),
-        ("fireworks", "accounts/fireworks/models/llama-v3p1-70b-instruct", "FIREWORKS_API_KEY"),
+        (
+            "together",
+            "meta-llama/Llama-3-70b-chat-hf",
+            "TOGETHER_API_KEY",
+        ),
+        (
+            "fireworks",
+            "accounts/fireworks/models/llama-v3p1-70b-instruct",
+            "FIREWORKS_API_KEY",
+        ),
         ("xai", "grok-2", "XAI_API_KEY"),
-        ("perplexity", "llama-3.1-sonar-large-128k-online", "PERPLEXITY_API_KEY"),
+        (
+            "perplexity",
+            "llama-3.1-sonar-large-128k-online",
+            "PERPLEXITY_API_KEY",
+        ),
         ("cohere", "command-r-plus", "COHERE_API_KEY"),
     ];
     for &(provider, model, env_var) in PROBE_ORDER {
-        if std::env::var(env_var).ok().filter(|v| !v.is_empty()).is_some() {
+        if std::env::var(env_var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
             return Some((provider, model, env_var));
         }
     }
     // Also check GOOGLE_API_KEY as alias for Gemini
-    if std::env::var("GOOGLE_API_KEY").ok().filter(|v| !v.is_empty()).is_some() {
+    if std::env::var("GOOGLE_API_KEY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
         return Some(("gemini", "gemini-2.5-flash", "GOOGLE_API_KEY"));
     }
     None
@@ -503,6 +590,7 @@ pub fn known_providers() -> &'static [&'static str] {
         "codex",
         "claude-code",
         "qwen-code",
+        "azure",
     ]
 }
 
@@ -606,7 +694,8 @@ mod tests {
         assert!(providers.contains(&"codex"));
         assert!(providers.contains(&"claude-code"));
         assert!(providers.contains(&"qwen-code"));
-        assert_eq!(providers.len(), 36);
+        assert!(providers.contains(&"azure"));
+        assert_eq!(providers.len(), 37);
     }
 
     #[test]
@@ -659,7 +748,10 @@ mod tests {
             skip_permissions: true,
         };
         let driver = create_driver(&config);
-        assert!(driver.is_ok(), "NVIDIA provider with env var should succeed");
+        assert!(
+            driver.is_ok(),
+            "NVIDIA provider with env var should succeed"
+        );
         std::env::remove_var("NVIDIA_API_KEY");
     }
 
@@ -690,7 +782,11 @@ mod tests {
         let result = create_driver(&config);
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
-        assert!(err.contains("base_url"), "Error should mention base_url: {}", err);
+        assert!(
+            err.contains("base_url"),
+            "Error should mention base_url: {}",
+            err
+        );
         std::env::remove_var("MYCUSTOM_API_KEY");
     }
 
@@ -713,5 +809,83 @@ mod tests {
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
+    }
+
+    #[test]
+    fn test_provider_defaults_azure() {
+        let d = provider_defaults("azure").unwrap();
+        assert_eq!(d.base_url, ""); // Azure requires user-supplied URL
+        assert_eq!(d.api_key_env, "AZURE_OPENAI_API_KEY");
+        assert!(d.key_required);
+    }
+
+    #[test]
+    fn test_provider_defaults_azure_openai_alias() {
+        let d = provider_defaults("azure-openai").unwrap();
+        assert_eq!(d.api_key_env, "AZURE_OPENAI_API_KEY");
+        assert!(d.key_required);
+    }
+
+    #[test]
+    fn test_azure_driver_creation_with_key_and_url() {
+        let config = DriverConfig {
+            provider: "azure".to_string(),
+            api_key: Some("test-azure-key".to_string()),
+            base_url: Some("https://myresource.openai.azure.com/openai/deployments".to_string()),
+            skip_permissions: true,
+        };
+        let driver = create_driver(&config);
+        assert!(driver.is_ok(), "Azure driver with key + URL should succeed");
+    }
+
+    #[test]
+    fn test_azure_driver_no_key_errors() {
+        let config = DriverConfig {
+            provider: "azure".to_string(),
+            api_key: None,
+            base_url: Some("https://myresource.openai.azure.com/openai/deployments".to_string()),
+            skip_permissions: true,
+        };
+        let result = create_driver(&config);
+        assert!(result.is_err(), "Azure driver without key should error");
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("AZURE_OPENAI_API_KEY"),
+            "Error should mention AZURE_OPENAI_API_KEY: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_azure_driver_no_url_errors() {
+        let config = DriverConfig {
+            provider: "azure".to_string(),
+            api_key: Some("test-azure-key".to_string()),
+            base_url: None,
+            skip_permissions: true,
+        };
+        let result = create_driver(&config);
+        assert!(result.is_err(), "Azure driver without URL should error");
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("base_url"),
+            "Error should mention base_url: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_azure_openai_alias_driver_creation() {
+        let config = DriverConfig {
+            provider: "azure-openai".to_string(),
+            api_key: Some("test-azure-key".to_string()),
+            base_url: Some("https://myresource.openai.azure.com/openai/deployments".to_string()),
+            skip_permissions: true,
+        };
+        let driver = create_driver(&config);
+        assert!(
+            driver.is_ok(),
+            "azure-openai alias should create driver successfully"
+        );
     }
 }
