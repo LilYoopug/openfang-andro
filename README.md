@@ -2,12 +2,12 @@
   <img src="public/assets/openfang-logo.png" width="160" alt="OpenFang Logo" />
 </p>
 
-<h1 align="center">Self experimenting on OpenFang</h1>
-<h3 align="center">The Agent Operating System</h3>
+<h1 align="center">OpenFang Andro</h1>
+<h3 align="center">Linux AArch64 Native Fork</h3>
 
 <p align="center">
-  Open-source Agent OS built in Rust. 137K LOC. 14 crates. 1,767+ tests. Zero clippy warnings.<br/>
-  <strong>One binary. Battle-tested. Agents that actually work for you.</strong>
+  Upstream OpenFang synced for Linux AArch64 users who need a native ARM release path.<br/>
+  <strong>This fork publishes only <code>openfang-aarch64-unknown-linux-gnu-native</code>.</strong>
 </p>
 
 <p align="center">
@@ -27,37 +27,44 @@
 
 ---
 
-> **v0.3.30 — Security Hardening Release (March 2026)**
+> **Fork scope**
 >
-> OpenFang is feature-complete but still pre-1.0. You may encounter rough edges or breaking changes between minor versions. We ship fast and fix fast. Pin to a specific commit for production use until v1.0. [Report issues here.](https://github.com/RightNow-AI/openfang/issues)
+> This repository is specifically for **Linux AArch64** systems. It exists for users
+> hitting **OpenSSL compatibility problems**, especially where older OpenSSL 1.0.x
+> expectations collide with the newer OpenSSL versions shipped by current Linux
+> distributions. The automation in this fork tracks upstream releases but preserves
+> the fork-owned installer, README, and GitHub workflow files.
 
 ---
 
 ## What is OpenFang?
 
-OpenFang is an **open-source Agent Operating System** — not a chatbot framework, not a Python wrapper around an LLM, not a "multi-agent orchestrator." It is a full operating system for autonomous agents, built from scratch in Rust.
+This fork follows the upstream OpenFang codebase, but its release output is narrower:
+it builds and publishes only the Linux AArch64 native artifact for this repository.
 
-Traditional agent frameworks wait for you to type something. OpenFang runs **autonomous agents that work for you** — on schedules, 24/7, building knowledge graphs, monitoring targets, generating leads, managing your social media, and reporting results to your dashboard.
+OpenFang itself is an **open-source Agent Operating System** — not a chatbot
+framework, not a Python wrapper around an LLM, and not a "multi-agent
+orchestrator." It is a full operating system for autonomous agents, built from
+scratch in Rust.
 
-The entire system compiles to a **single ~32MB binary**. One install, one command, your agents are live.
+Traditional agent frameworks wait for you to type something. OpenFang runs
+**autonomous agents that work for you** on schedules, 24/7, building knowledge
+graphs, monitoring targets, generating leads, managing your social media, and
+reporting results to your dashboard.
+
+## This Fork Ships Only One Build
+
+- Platform: Linux AArch64 / ARM64
+- Artifact: `openfang-aarch64-unknown-linux-gnu-native.tar.gz`
+- Release tags: `vX.Y.Z-andro`
+- Installer: [`install.sh`](./install.sh)
 
 ```bash
-curl -fsSL https://openfang.sh/install | sh
+curl -fsSL https://raw.githubusercontent.com/LilYoopug/openfang-andro/main/install.sh | sh
 openfang init
 openfang start
 # Dashboard live at http://localhost:4200
 ```
-
-<details>
-<summary><strong>Windows</strong></summary>
-
-```powershell
-irm https://openfang.sh/install.ps1 | iex
-openfang init
-openfang start
-```
-
-</details>
 
 ---
 

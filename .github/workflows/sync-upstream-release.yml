@@ -1,0 +1,158 @@
+name: Sync Upstream Release
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve latest upstream release
+        id: upstream
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const release = await github.rest.repos.getLatestRelease({
+              owner: 'RightNow-AI',
+              repo: 'openfang',
+            });
+
+            core.setOutput('upstream_tag', release.data.tag_name);
+            core.setOutput('fork_tag', `${release.data.tag_name}-andro`);
+            core.setOutput('release_name', release.data.name || release.data.tag_name);
+            core.setOutput('release_body', release.data.body || '');
+            core.setOutput('prerelease', String(release.data.prerelease));
+
+      - name: Merge upstream and create fork tag
+        id: sync
+        env:
+          FORK_TAG: ${{ steps.upstream.outputs.fork_tag }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
+        run: |
+          set -eu
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${FORK_TAG}" >/dev/null 2>&1; then
+            echo "already_synced=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git remote get-url upstream >/dev/null 2>&1 || git remote add upstream https://github.com/RightNow-AI/openfang.git
+          git fetch origin main --tags
+          git fetch upstream main --tags
+          git pull --ff-only origin main
+
+          merge_rc=0
+          git merge --no-ff --no-commit upstream/main || merge_rc=$?
+
+          git restore --source=HEAD --staged --worktree .github/workflows install.sh README.md
+
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "Merge conflicts remain after restoring protected files:"
+            git status --short
+            git merge --abort || true
+            exit 1
+          fi
+
+          if [ "$merge_rc" -ne 0 ]; then
+            echo "git merge reported conflicts, but all remaining conflicts were resolved by protected-file restore."
+          fi
+
+          if ! git diff --cached --quiet || ! git diff --quiet; then
+            git add -A
+            git commit -m "Merge upstream/main for ${UPSTREAM_TAG} while preserving fork files"
+            git push origin main
+          fi
+
+          git tag -a "${FORK_TAG}" -m "${FORK_TAG}"
+          git push origin "${FORK_TAG}"
+          echo "already_synced=false" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update fork release
+        if: steps.sync.outputs.already_synced != 'true'
+        uses: actions/github-script@v8
+        env:
+          FORK_TAG: ${{ steps.upstream.outputs.fork_tag }}
+          RELEASE_NAME: ${{ steps.upstream.outputs.release_name }}
+          RELEASE_BODY: ${{ steps.upstream.outputs.release_body }}
+          PRERELEASE: ${{ steps.upstream.outputs.prerelease }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.FORK_TAG;
+            const note = [
+              '',
+              '---',
+              '',
+              'Fork note: this fork publishes only the Linux AArch64 native artifact `openfang-aarch64-unknown-linux-gnu-native.tar.gz`.',
+            ].join('\n');
+            const body = `${process.env.RELEASE_BODY || ''}${note}`;
+            const prerelease = process.env.PRERELEASE === 'true';
+
+            try {
+              const existing = await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag,
+              });
+
+              await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: existing.data.id,
+                tag_name: tag,
+                name: process.env.RELEASE_NAME,
+                body,
+                draft: false,
+                prerelease,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name: process.env.RELEASE_NAME,
+                body,
+                draft: false,
+                prerelease,
+              });
+            }
+
+      - name: Dispatch ARM build workflow
+        if: steps.sync.outputs.already_synced != 'true'
+        uses: actions/github-script@v8
+        env:
+          FORK_TAG: ${{ steps.upstream.outputs.fork_tag }}
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build-openfang-full-arm.yml',
+              ref: 'main',
+              inputs: {
+                release_tag: process.env.FORK_TAG,
+              },
+            });

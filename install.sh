@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-# OpenFang Installer (1BigBear fork - proot-distro ARM64 support)
-# https://raw.githubusercontent.com/1BigBear/openfang/main/install.sh
+# OpenFang Installer (Linux AArch64 native fork)
+# https://raw.githubusercontent.com/LilYoopug/openfang-andro/main/install.sh
 
-REPO="1BigBear/openfang"
+REPO="LilYoopug/openfang-andro"
 INSTALL_DIR="$HOME/.openfang"
 BIN_DIR="$HOME/.openfang/bin"
 BINARY="openfang"
@@ -17,32 +17,17 @@ main() {
   _os="$(uname -s)"
   _arch="$(uname -m)"
 
-  case "$_os" in
-    Linux)
-      case "$_arch" in
-        x86_64|amd64)
-          _target="x86_64-unknown-linux-gnu"
-          ;;
-        aarch64|arm64)
-          _target="aarch64-unknown-linux-gnu-native"
-          ;;
-        *)
-          err "Unsupported architecture: $_arch"
-          ;;
-      esac
-      ;;
-    Darwin)
-      case "$_arch" in
-        x86_64|amd64)  _target="x86_64-apple-darwin" ;;
-        aarch64|arm64) _target="aarch64-apple-darwin" ;;
-        *)             err "Unsupported architecture: $_arch" ;;
-      esac
+  [ "$_os" = "Linux" ] || err "Unsupported OS: $_os (this fork only ships Linux AArch64 builds)"
+
+  case "$_arch" in
+    aarch64|arm64)
       ;;
     *)
-      err "Unsupported OS: $_os"
+      err "Unsupported architecture: $_arch (this fork only ships Linux AArch64 builds)"
       ;;
   esac
 
+  _target="aarch64-unknown-linux-gnu-native"
   _url="https://github.com/${REPO}/releases/latest/download/openfang-${_target}.tar.gz"
 
   say "Detected: $_os $_arch -> $_target"

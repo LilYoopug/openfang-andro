@@ -2,9 +2,13 @@ name: Build OpenFang Full (ARM Ubuntu)
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to build and upload assets for"
+        required: false
   push:
     tags:
-      - "v*"
+      - "v*-andro"
 
 permissions:
   contents: write
@@ -14,8 +18,24 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     steps:
+      - name: Resolve checkout and release refs
+        id: refs
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.release_tag }}" ]; then
+            echo "checkout_ref=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "checkout_ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.refs.outputs.checkout_ref }}
 
       - name: System deps (build)
         run: |
@@ -39,11 +59,10 @@ jobs:
         run: |
           cargo build --release --workspace --locked
 
-      - name: Collect release binaries
+      - name: Collect release binary
         run: |
           mkdir -p out/bin
-          find target/release -maxdepth 1 -type f -executable \
-            ! -name "*.d" ! -name "build-script-*" -exec cp {} out/bin/ \;
+          cp target/release/openfang out/bin/openfang
           ls -lah out/bin
 
       - name: Package
@@ -51,17 +70,18 @@ jobs:
           tar -C out -czf openfang-aarch64-unknown-linux-gnu-native.tar.gz bin
           sha256sum openfang-aarch64-unknown-linux-gnu-native.tar.gz > openfang-aarch64-unknown-linux-gnu-native.tar.gz.sha256
 
-      - name: Upload artifact (manual run)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload artifact (manual run without release tag)
+        if: github.event_name == 'workflow_dispatch' && steps.refs.outputs.release_tag == ''
         uses: actions/upload-artifact@v4
         with:
           name: openfang-aarch64-unknown-linux-gnu-native
           path: openfang-aarch64-unknown-linux-gnu-native.tar.gz
 
-      - name: Upload to GitHub Release (tag run)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload to GitHub Release
+        if: steps.refs.outputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.refs.outputs.release_tag }}
           files: |
             openfang-aarch64-unknown-linux-gnu-native.tar.gz
             openfang-aarch64-unknown-linux-gnu-native.tar.gz.sha256
