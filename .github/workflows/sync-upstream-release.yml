@@ -34,18 +34,36 @@ jobs:
               owner: 'RightNow-AI',
               repo: 'openfang',
             });
+            const upstreamTag = release.data.tag_name;
+            const match = /^v(\d+\.\d+\.\d+)$/.exec(upstreamTag);
 
-            core.setOutput('upstream_tag', release.data.tag_name);
-            core.setOutput('fork_tag', `${release.data.tag_name}-andro`);
-            core.setOutput('release_name', release.data.name || release.data.tag_name);
+            if (!match) {
+              throw new Error(`Unsupported upstream tag format: ${upstreamTag}`);
+            }
+
+            core.setOutput('upstream_tag', upstreamTag);
+            core.setOutput('fork_tag', `${upstreamTag}-andro`);
+            core.setOutput('cargo_version', match[1]);
+            core.setOutput('release_name', release.data.name || upstreamTag);
             core.setOutput('release_body', release.data.body || '');
             core.setOutput('prerelease', String(release.data.prerelease));
+
+      - name: Validate derived Cargo version
+        env:
+          CARGO_VERSION: ${{ steps.upstream.outputs.cargo_version }}
+        run: |
+          set -eu
+          [ -n "${CARGO_VERSION}" ]
+          case "${CARGO_VERSION}" in
+            v*) echo "cargo_version must not include leading v: ${CARGO_VERSION}" >&2; exit 1 ;;
+          esac
 
       - name: Merge upstream and create fork tag
         id: sync
         env:
           FORK_TAG: ${{ steps.upstream.outputs.fork_tag }}
           UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
+          CARGO_VERSION: ${{ steps.upstream.outputs.cargo_version }}
         run: |
           set -eu
 
@@ -74,6 +92,52 @@ jobs:
           if [ "$merge_rc" -ne 0 ]; then
             echo "git merge reported conflicts, but all remaining conflicts were resolved by protected-file restore."
           fi
+
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import sys
+
+          cargo_version = os.environ["CARGO_VERSION"]
+          path = Path("Cargo.toml")
+          lines = path.read_text().splitlines(keepends=True)
+          in_workspace_package = False
+          replaced = False
+
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped == "[workspace.package]":
+                  in_workspace_package = True
+                  continue
+              if in_workspace_package and stripped.startswith("["):
+                  break
+              if in_workspace_package and re.match(r'^version\s*=\s*"[^"]+"$', stripped):
+                  newline = "\n" if line.endswith("\n") else ""
+                  lines[index] = f'version = "{cargo_version}"{newline}'
+                  replaced = True
+                  break
+
+          if not replaced:
+              print("Failed to update [workspace.package] version in Cargo.toml", file=sys.stderr)
+              sys.exit(1)
+
+          path.write_text("".join(lines))
+          PY
+
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import sys
+
+          cargo_version = os.environ["CARGO_VERSION"]
+          text = Path("Cargo.toml").read_text()
+          match = re.search(r'(?ms)^\[workspace\.package\]\n(.*?)(?:^\[|\Z)', text)
+          if not match or f'version = "{cargo_version}"' not in match.group(1):
+              print(f'Cargo.toml workspace version does not match expected {cargo_version}', file=sys.stderr)
+              sys.exit(1)
+          PY
 
           if ! git diff --cached --quiet || ! git diff --quiet; then
             git add -A
